@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#7ec8f0" />
+<title>Flappy Doggo 🐶💨</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐶</text></svg>">
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #111; touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+  #game { display: block; width: 100vw; height: 100vh; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+'use strict';
+
+/* ============================================================
+   SETUP
+   ============================================================ */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const WORLD_H = 700;
+const GROUND_H = 70;
+const GRAV = 1950;
+const FLAP = -570;
+const PIPE_W = 74;
+const GAP = 196;
+const SPEED = 190;
+const SPAWN_DIST = 250;
+const DOG_R = 17;               // collision radius
+const FONT = '"Trebuchet MS", "Segoe UI", system-ui, -apple-system, sans-serif';
+
+let WORLD_W = 400;
+let scale = 1;
+let dpr = 1;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = window.innerWidth, h = window.innerHeight;
+  canvas.width = Math.floor(w * dpr);
+  canvas.height = Math.floor(h * dpr);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  scale = h / WORLD_H;
+  WORLD_W = w / scale;
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', resize);
+resize();
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+/* ============================================================
+   AUDIO  (all synthesized — no asset files needed)
+   ============================================================ */
+let actx = null;
+let noiseBuf = null;
+let muted = localStorage.getItem('flappydog_muted') === '1';
+
+function audio() {
+  if (!actx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) actx = new AC();
+  }
+  if (actx && actx.state === 'suspended') actx.resume();
+  return actx;
+}
+
+function getNoise(a) {
+  if (!noiseBuf) {
+    noiseBuf = a.createBuffer(1, Math.floor(a.sampleRate), a.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  return noiseBuf;
+}
+
+/* "WOOF" — pitched saw with a fast downward sweep + noise chuff */
+function playBark(a) {
+  const t = a.currentTime;
+  const out = a.createGain();
+  out.gain.value = 0.85;
+  out.connect(a.destination);
+
+  const osc = a.createOscillator();
+  osc.type = 'sawtooth';
+  const base = 480 + Math.random() * 120;
+  osc.frequency.setValueAtTime(base, t);
+  osc.frequency.exponentialRampToValueAtTime(base * 0.42, t + 0.09);
+  osc.frequency.exponentialRampToValueAtTime(base * 0.25, t + 0.17);
+
+  const bp = a.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.setValueAtTime(1150, t);
+  bp.frequency.exponentialRampToValueAtTime(560, t + 0.17);
+  bp.Q.value = 1.3;
+
+  const g = a.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.55, t + 0.008);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+
+  osc.connect(bp); bp.connect(g); g.connect(out);
+  osc.start(t); osc.stop(t + 0.22);
+
+  // breathy chuff
+  const src = a.createBufferSource();
+  src.buffer = getNoise(a);
+  const nf = a.createBiquadFilter();
+  nf.type = 'bandpass'; nf.frequency.value = 950; nf.Q.value = 0.7;
+  const ng = a.createGain();
+  ng.gain.setValueAtTime(0.30, t);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
+  src.connect(nf); nf.connect(ng); ng.connect(out);
+  src.start(t); src.stop(t + 0.14);
+}
+
+/* "PRRRT" — low wobbling saw with a resonant lowpass */
+function playFart(a) {
+  const t = a.currentTime;
+  const dur = 0.40 + Math.random() * 0.25;
+  const out = a.createGain();
+  out.gain.value = 0.85;
+  out.connect(a.destination);
+
+  const osc = a.createOscillator();
+  osc.type = 'sawtooth';
+  const f0 = 90 + Math.random() * 45;
+  osc.frequency.setValueAtTime(f0, t);
+  osc.frequency.exponentialRampToValueAtTime(f0 * 0.42, t + dur);
+
+  const lfo = a.createOscillator();
+  lfo.type = 'sine';
+  lfo.frequency.setValueAtTime(24, t);
+  lfo.frequency.linearRampToValueAtTime(8, t + dur);
+  const lfoG = a.createGain();
+  lfoG.gain.setValueAtTime(32, t);
+  lfoG.gain.linearRampToValueAtTime(5, t + dur);
+  lfo.connect(lfoG); lfoG.connect(osc.frequency);
+
+  const lp = a.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(950, t);
+  lp.frequency.exponentialRampToValueAtTime(280, t + dur);
+  lp.Q.value = 7;
+
+  const g = a.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.55, t + 0.03);
+  g.gain.setValueAtTime(0.55, t + dur * 0.68);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+  osc.connect(lp); lp.connect(g); g.connect(out);
+  osc.start(t); lfo.start(t);
+  osc.stop(t + dur + 0.06); lfo.stop(t + dur + 0.06);
+
+  // airy hiss
+  const src = a.createBufferSource();
+  src.buffer = getNoise(a);
+  const nf = a.createBiquadFilter();
+  nf.type = 'bandpass'; nf.frequency.value = 430; nf.Q.value = 0.6;
+  const ng = a.createGain();
+  ng.gain.setValueAtTime(0.16, t);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(nf); nf.connect(ng); ng.connect(out);
+  src.start(t); src.stop(t + dur);
+}
+
+/* ============================================================
+   GAME STATE
+   ============================================================ */
+const state = {
+  mode: 'ready',              // ready | playing | dead
+  time: 0,
+  dog: { x: 120, y: 300, vy: 0, rot: 0 },
+  pipes: [],
+  particles: [],
+  score: 0,
+  best: parseInt(localStorage.getItem('flappydog_best') || '0', 10) || 0,
+  shake: 0,
+  deadTimer: 0,
+  flapAnim: 0
+};
+
+const clouds = [];
+for (let i = 0; i < 8; i++) {
+  clouds.push({
+    x: Math.random() * 900,
+    y: rand(30, 250),
+    s: rand(0.55, 1.25),
+    spd: rand(7, 20)
+  });
+}
+
+/* ============================================================
+   PARTICLES
+   ============================================================ */
+function addParticle(p) {
+  p.maxLife = p.life;
+  state.particles.push(p);
+}
+
+function emitBarkFx() {
+  const d = state.dog;
+  for (let i = 0; i < 3; i++) {
+    addParticle({
+      type: 'ring', x: d.x + 26, y: d.y - 8,
+      vx: 70 + i * 45, vy: rand(-18, 18),
+      r: 6, life: 0.45
+    });
+  }
+  addParticle({
+    type: 'text', x: d.x + 12, y: d.y - 40,
+    vx: 0, vy: -62, text: 'WOOF!', color: '#ffffff',
+    size: 21, life: 0.85
+  });
+}
+
+function emitFartFx() {
+  const d = state.dog;
+  for (let i = 0; i < 10; i++) {
+    addParticle({
+      type: 'puff',
+      x: d.x - 20 + rand(-5, 6),
+      y: d.y + 5 + rand(-10, 10),
+      vx: -85 - Math.random() * 110,
+      vy: rand(-38, 38),
+      r: rand(5, 10),
+      c: Math.random() < 0.5 ? '150,205,95' : '198,225,130',
+      life: rand(0.55, 1.0)
+    });
+  }
+  addParticle({
+    type: 'text', x: d.x - 24, y: d.y - 36,
+    vx: -25, vy: -58, text: 'PRRRT!', color: '#c8f07a',
+    size: 21, life: 0.95
+  });
+}
+
+/* ============================================================
+   GAME FLOW
+   ============================================================ */
+function reset() {
+  state.mode = 'ready';
+  state.score = 0;
+  state.pipes.length = 0;
+  state.particles.length = 0;
+  state.deadTimer = 0;
+  state.shake = 0;
+  state.dog.x = clamp(WORLD_W * 0.30, 80, 260);
+  state.dog.y = WORLD_H * 0.42;
+  state.dog.vy = 0;
+  state.dog.rot = 0;
+}
+
+function spawnPipe() {
+  const minTop = 70;
+  const maxTop = WORLD_H - GROUND_H - GAP - 50;
+  const prev = state.pipes[state.pipes.length - 1];
+  let top = prev ? prev.gapY + rand(-155, 155) : rand(minTop, maxTop);
+  top = clamp(top, minTop, maxTop);
+  state.pipes.push({ x: WORLD_W + PIPE_W, gapY: top, scored: false });
+}
+
+function startGame() {
+  state.mode = 'playing';
+  state.dog.vy = FLAP;
+  state.pipes.length = 0;
+  spawnPipe();
+}
+
+function flap() {
+  if (state.mode === 'ready') {
+    startGame();
+    return;
+  }
+  if (state.mode !== 'playing') return;
+
+  state.dog.vy = FLAP;
+  state.flapAnim = 1;
+
+  const a = audio();
+  const isFart = Math.random() < 0.42;
+
+  if (a && !muted) {
+    if (isFart) playFart(a); else playBark(a);
+  }
+  if (isFart) emitFartFx(); else emitBarkFx();
+}
+
+function die() {
+  if (state.mode !== 'playing') return;
+  state.mode = 'dead';
+  state.deadTimer = 0;
+  state.shake = 1;
+
+  // the dog always lets one go on impact 💨
+  emitFartFx();
+  const a = audio();
+  if (a && !muted) setTimeout(() => playFart(a), 90);
+
+  localStorage.setItem('flappydog_best', String(state.best));
+}
+
+/* ============================================================
+   INPUT
+   ============================================================ */
+function onTap(e) {
+  if (e && e.cancelable) e.preventDefault();
+  audio(); // unlock on first user gesture
+
+  if (state.mode === 'dead') {
+    if (state.deadTimer > 0.65) reset();
+    return;
+  }
+  flap();
+}
+
+window.addEventListener('pointerdown', onTap, { passive: false });
+window.addEventListener('touchstart', e => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+window.addEventListener('contextmenu', e => e.preventDefault());
+
+window.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW' || e.code === 'Enter') {
+    e.preventDefault();
+    audio();
+    if (state.mode === 'dead') { if (state.deadTimer > 0.65) reset(); return; }
+    flap();
+  }
+  if (e.code === 'KeyM') {
+    muted = !muted;
+    localStorage.setItem('flappydog_muted', muted ? '1' : '0');
+  }
+});
+
+/* ============================================================
+   UPDATE
+   ============================================================ */
+function circleRect(cx, cy, r, rx, ry, rw, rh) {
+  const nx = clamp(cx, rx, rx + rw);
+  const ny = clamp(cy, ry, ry + rh);
+  const dx = cx - nx, dy = cy - ny;
+  return dx * dx + dy * dy < r * r;
+}
+
+function update(dt) {
+  state.time += dt;
+
+  // clouds
+  for (const c of clouds) {
+    c.x -= c.spd * dt;
+    if (c.x < -140) { c.x = WORLD_W + rand(60, 260); c.y = rand(30, 250); c.s = rand(0.55, 1.25); }
+  }
+
+  const d = state.dog;
+  const groundY = WORLD_H - GROUND_H;
+
+  if (state.mode === 'ready') {
+    d.y = WORLD_H * 0.42 + Math.sin(state.time * 3) * 11;
+    d.rot = Math.sin(state.time * 3) * 0.09;
+    state.flapAnim = Math.max(0, state.flapAnim - dt * 4);
+
+  } else if (state.mode === 'playing') {
+    d.vy += GRAV * dt;
+    d.y += d.vy * dt;
+    if (d.y < DOG_R) { d.y = DOG_R; d.vy = Math.max(d.vy, 0); }
+    d.rot = clamp(d.vy * 0.0011, -0.45, 1.15);
+    state.flapAnim = Math.max(0, state.flapAnim - dt * 4);
+
+    // pipes
+    for (const p of state.pipes) p.x -= SPEED * dt;
+    state.pipes = state.pipes.filter(p => p.x + PIPE_W > -30);
+
+    const last = state.pipes[state.pipes.length - 1];
+    if (!last || last.x < WORLD_W - SPAWN_DIST) spawnPipe();
+
+    // score
+    for (const p of state.pipes) {
+      if (!p.scored && p.x + PIPE_W < d.x) {
+        p.scored = true;
+        state.score++;
+        if (state.score > state.best) {
+          state.best = state.score;
+          localStorage.setItem('flappydog_best', String(state.best));
+        }
+      }
+    }
+
+    // collisions
+    if (d.y + DOG_R * 0.85 > groundY) { d.y = groundY - DOG_R * 0.85; die(); }
+    else {
+      for (const p of state.pipes) {
+        const topH = p.gapY;
+        const botY = p.gapY + GAP;
+        if (circleRect(d.x, d.y, DOG_R, p.x, -200, PIPE_W, topH + 200) ||
+            circleRect(d.x, d.y, DOG_R, p.x, botY, PIPE_W, WORLD_H - botY)) {
+          die();
+          break;
+        }
+      }
+    }
+
+  } else { // dead
+    state.deadTimer += dt;
+    d.vy += GRAV * dt;
+    d.y += d.vy * dt;
+    d.rot = Math.min(1.65, d.rot + dt * 5);
+    const floor = groundY - DOG_R * 0.85;
+    if (d.y > floor) { d.y = floor; d.vy = 0; }
+    state.flapAnim = Math.max(0, state.flapAnim - dt * 4);
+  }
+
+  // particles
+  for (let i = state.particles.length - 1; i >= 0; i--) {
+    const p = state.particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { state.particles.splice(i, 1); continue; }
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    if (p.type === 'puff') {
+      p.vy -= 34 * dt;
+      p.vx *= (1 - 1.6 * dt);
+      p.r += 16 * dt;
+    } else if (p.type === 'ring') {
+      p.r += 145 * dt;
+    } else if (p.type === 'text') {
+      p.vy += 45 * dt;
+    }
+  }
+
+  state.shake = Math.max(0, state.shake - dt * 2.6);
+}
+
+/* ============================================================
+   DRAW HELPERS
+   ============================================================ */
+function ellipsePath(x, y, rx, ry, rot) {
+  ctx.beginPath();
+  ctx.ellipse(x, y, rx, ry, rot || 0, 0, Math.PI * 2);
+}
+
+function roundRectPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function setFont(size, weight) {
+  ctx.font = `${weight || 'bold'} ${size}px ${FONT}`;
+}
+
+/* ============================================================
+   DRAW: BACKGROUND
+   ============================================================ */
+function drawBackground() {
+  const groundY = WORLD_H - GROUND_H;
+
+  const sky = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+  sky.addColorStop(0, '#5fb8ea');
+  sky.addColorStop(0.55, '#a8ddf5');
+  sky.addColorStop(1, '#e6f7ff');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+
+  // sun
+  ctx.fillStyle = 'rgba(255,246,180,0.85)';
+  ctx.beginPath(); ctx.arc(WORLD_W - 78, 88, 40, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = 'rgba(255,252,214,0.55)';
+  ctx.beginPath(); ctx.arc(WORLD_W - 78, 88, 58, 0, Math.PI * 2); ctx.fill();
+
+  // clouds
+  for (const c of clouds) {
+    ctx.fillStyle = 'rgba(255,255,255,0.78)';
+    const s = c.s;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, 26 * s, 0, Math.PI * 2);
+    ctx.arc(c.x + 30 * s, c.y + 6 * s, 20 * s, 0, Math.PI * 2);
+    ctx.arc(c.x - 30 * s, c.y + 8 * s, 18 * s, 0, Math.PI * 2);
+    ctx.arc(c.x + 8 * s, c.y - 14 * s, 19 * s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // far hills
+  ctx.fillStyle = '#9ed6a5';
+  const off1 = (state.time * 11) % 210;
+  for (let x = -210; x < WORLD_W + 210; x += 210) {
+    ctx.beginPath();
+    ctx.arc(x - off1 + 105, groundY + 6, 96, Math.PI, 0);
+    ctx.fill();
+  }
+
+  // near hills
+  ctx.fillStyle = '#7cc98a';
+  const off2 = (state.time * 22) % 150;
+  for (let x = -150; x < WORLD_W + 150; x += 150) {
+    ctx.beginPath();
+    ctx.arc(x - off2 + 75, groundY + 10, 68, Math.PI, 0);
+    ctx.fill();
+  }
+}
+
+/* ============================================================
+   DRAW: PIPES
+   ============================================================ */
+function drawPipes() {
+  const capH = 26;
+
+  for (const p of state.pipes) {
+    const topH = p.gapY;
+    const botY = p.gapY + GAP;
+
+    drawPipeBody(p.x, 0, PIPE_W, topH - capH);
+    drawPipeCap(p.x - 6, topH - capH, PIPE_W + 12, capH);
+
+    drawPipeBody(p.x, botY + capH, PIPE_W, WORLD_H - GROUND_H - (botY + capH));
+    drawPipeCap(p.x - 6, botY, PIPE_W + 12, capH);
+  }
+}
+
+function drawPipeBody
